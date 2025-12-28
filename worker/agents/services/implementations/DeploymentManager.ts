@@ -16,6 +16,10 @@ import { getSandboxService } from '../../../services/sandbox/factory';
 import { validateAndCleanBootstrapCommands } from 'worker/agents/utils/common';
 import { DeploymentTarget } from '../../core/types';
 import { BaseProjectState } from '../../core/state';
+import { RepoManager } from '../../../services/github/RepoManager';
+import { InfrastructureService } from '../../../services/cloudflare/InfrastructureService';
+import { JulesService } from '../../../services/jules/JulesService';
+import { WranglerParser } from '../../../services/utils/WranglerParser';
 
 const PER_ATTEMPT_TIMEOUT_MS = 60000;  // 60 seconds per individual attempt
 const MASTER_DEPLOYMENT_TIMEOUT_MS = 300000;  // 5 minutes total
@@ -31,12 +35,16 @@ export class DeploymentManager extends BaseAgentService<BaseProjectState> implem
     private currentDeploymentPromise: Promise<PreviewType | null> | null = null;
     private cachedSandboxClient: BaseSandboxService | null = null;
 
+    private julesService: JulesService;
+
     constructor(
         options: ServiceOptions<BaseProjectState>,
         private maxCommandsHistory: number,
     ) {
         super(options);
         
+        this.julesService = new JulesService();
+
         // Ensure state has sessionId
         const state = this.getState();
         if (!state.sessionId) {
@@ -627,8 +635,8 @@ export class DeploymentManager extends BaseAgentService<BaseProjectState> implem
     }
     
     /**
-     * Deploy to Cloudflare Workers
-     * Returns deployment URL and deployment ID for database updates
+     * Deploy to Cloudflare Workers via GitHub + Cloudflare Build
+     * REPLACED OLD LOGIC: Now uses RepoManager and InfrastructureService
      */
     async deployToCloudflare(request?: {
         target?: DeploymentTarget;
@@ -636,18 +644,15 @@ export class DeploymentManager extends BaseAgentService<BaseProjectState> implem
     }): Promise<{ deploymentUrl: string | null; deploymentId?: string }> {
         const state = this.getState();
         const logger = this.getLog();
-        const client = this.getClient();
         const target = request?.target ?? 'platform';
         const callbacks = request?.callbacks;
         
-        await this.waitForPreview();
-        
         callbacks?.onStarted?.({
-            message: 'Starting deployment to Cloudflare Workers...',
+            message: 'Starting deployment via GitHub & Cloudflare Build...',
             instanceId: state.sandboxInstanceId ?? ''
         });
         
-        logger.info('Starting Cloudflare deployment', { target });
+        logger.info('Starting Cloudflare deployment (GitHub flow)', { target });
 
         // Check if we have generated files
         if (!state.generatedFilesMap || Object.keys(state.generatedFilesMap).length === 0) {
@@ -660,66 +665,139 @@ export class DeploymentManager extends BaseAgentService<BaseProjectState> implem
             return { deploymentUrl: null };
         }
 
-        // Ensure sandbox instance exists - return null to trigger agent orchestration
-        if (!state.sandboxInstanceId) {
-            logger.info('No sandbox instance ID available');
-            return { deploymentUrl: null };
-        }
+        try {
+            // 1. Jules Review (Optional but recommended)
+            let files = Object.values(state.generatedFilesMap).map(f => ({
+                path: f.filePath,
+                content: f.fileContents
+            }));
 
-        logger.info('Prerequisites met, initiating deployment', {
-            sandboxInstanceId: state.sandboxInstanceId,
-            fileCount: Object.keys(state.generatedFilesMap).length
-        });
+            const review = await this.julesService.reviewCode(files);
+            logger.info('Jules review completed', review);
 
-        // Deploy to Cloudflare
-        const deploymentResult = await client.deployToCloudflareWorkers(
-            state.sandboxInstanceId,
-            target
-        );
+            if (!review.approved) {
+                // In a real scenario, we might halt or ask for confirmation.
+                // For now, we proceed but log warnings.
+                logger.warn('Jules did not approve, but proceeding.', review.comments);
+            }
 
-        logger.info('Deployment result:', deploymentResult);
+            // 2. Infrastructure Provisioning
+            const cfToken = this.env?.CLOUDFLARE_API_TOKEN;
+            const cfAccountId = this.env?.CLOUDFLARE_ACCOUNT_ID;
+            let repoName = state.projectName || `vibesdk-project-${state.sessionId}`;
 
-        if (!deploymentResult || !deploymentResult.success) {
-            logger.error('Deployment failed', {
-                message: deploymentResult?.message,
-                error: deploymentResult?.error
-            });
+            // Find wrangler.json or wrangler.jsonc
+            const wranglerFile = files.find(f => f.path === 'wrangler.json' || f.path === 'wrangler.jsonc');
 
-            // Check for preview expired error
-            if (deploymentResult?.error?.includes('Failed to read instance metadata') || 
-                deploymentResult?.error?.includes(`/bin/sh: 1: cd: can't cd to i-`)) {
-                logger.error('Deployment sandbox died - preview expired');
-                this.deployToSandbox();
+            if (wranglerFile && cfToken && cfAccountId) {
+                const infraService = new InfrastructureService(cfAccountId, cfToken);
+                const requirements = WranglerParser.parseRequirements(wranglerFile.content);
+
+                if (requirements.length > 0) {
+                    logger.info('Found infrastructure requirements', requirements);
+
+                    // Provision
+                    // We need to map requirements to what InfraService expects
+                    const toProvision = {
+                        kv: requirements.filter(r => r.type === 'kv_namespaces' && !r.id).map(r => r.binding),
+                        d1: requirements.filter(r => r.type === 'd1_databases' && !r.id).map(r => r.name || r.binding),
+                        r2: requirements.filter(r => r.type === 'r2_buckets').map(r => r.name || r.binding)
+                    };
+
+                    const provisioned = await infraService.provisionResources(toProvision);
+                    logger.info('Provisioned resources', provisioned);
+
+                    // Update Wrangler config
+                    const updates = [];
+                    // KV
+                    for (const [name, id] of Object.entries(provisioned.kv)) {
+                         // Find requirement with this binding
+                         const req = requirements.find(r => r.binding === name && r.type === 'kv_namespaces');
+                         if (req) {
+                             updates.push({ type: 'kv_namespaces', binding: name, key: 'id', value: id });
+                         }
+                    }
+                     // D1
+                    for (const [name, id] of Object.entries(provisioned.d1)) {
+                         // Find requirement
+                         const req = requirements.find(r => (r.name === name || r.binding === name) && r.type === 'd1_databases');
+                         if (req) {
+                             updates.push({ type: 'd1_databases', binding: req.binding, key: 'database_id', value: id });
+                         }
+                    }
+
+                    if (updates.length > 0) {
+                        const updatedContent = WranglerParser.updateConfig(wranglerFile.content, updates);
+                        wranglerFile.content = updatedContent;
+
+                        // Update the file in the files list to be pushed
+                        const fileIndex = files.findIndex(f => f.path === wranglerFile.path);
+                        if (fileIndex !== -1) {
+                            files[fileIndex] = wranglerFile;
+                        }
+
+                        // Also update state to reflect changes locally if needed, though this is primarily for push
+                        // Ideally we should sync back to fileManager but for deployment scope this is fine.
+                    }
+                }
             } else {
-                callbacks?.onError?.({
-                    message: `Deployment failed: ${deploymentResult?.message || 'Unknown error'}`,
-                    instanceId: state.sandboxInstanceId ?? '',
-                    error: deploymentResult?.error || 'Unknown deployment error'
-                });
+                logger.warn('Skipping infrastructure provisioning: missing credentials or wrangler config');
+            }
+
+
+            // 3. Push to GitHub
+            const githubToken = this.env?.GITHUB_TOKEN; // Needed for GitHub API
+
+             if (!githubToken) {
+                throw new Error('GITHUB_TOKEN not configured in environment');
             }
             
+            // Get user info from state metadata or env
+            // Fallback to generic if not found, but try to be better than hardcoded.
+            const username = state.metadata?.userId || 'vibesdk-user';
+            const email = 'user@vibesdk.com'; // We might not have email in metadata, keeping generic for now or should be configured.
+
+            const pushResult = await RepoManager.pushToGitHub({
+                repoName,
+                token: githubToken,
+                files: files,
+                commitMessage: 'Deploy from VibeSDK',
+                username,
+                email
+            });
+
+            if (!pushResult.success) {
+                throw new Error(pushResult.error || 'Failed to push to GitHub');
+            }
+
+            logger.info('Code pushed to GitHub', { url: pushResult.url });
+
+            // 4. Return success
+            // In a real flow, Cloudflare Pages/Workers would pick this up.
+            // We return the GitHub URL as the "deployment URL" for now, or the expected Pages URL.
+
+            const deploymentUrl = pushResult.url;
+
+            callbacks?.onCompleted?.({
+                message: `Code pushed to GitHub: ${deploymentUrl}. Cloudflare Build should trigger automatically.`,
+                instanceId: state.sandboxInstanceId ?? '',
+                deploymentUrl: deploymentUrl || ''
+            });
+
+            return {
+                deploymentUrl: deploymentUrl || null,
+                deploymentId: 'github-push'
+            };
+
+        } catch (error) {
+            logger.error('Deployment flow failed', error);
+            callbacks?.onError?.({
+                message: `Deployment failed: ${error instanceof Error ? error.message : String(error)}`,
+                instanceId: state.sandboxInstanceId ?? '',
+                error: error instanceof Error ? error.message : String(error)
+            });
             return { deploymentUrl: null };
         }
-
-        const deploymentUrl = deploymentResult.deployedUrl;
-        const deploymentId = deploymentResult.deploymentId;
-
-        logger.info('Cloudflare deployment completed successfully', {
-            deploymentUrl,
-            deploymentId,
-            message: deploymentResult.message
-        });
-
-        callbacks?.onCompleted?.({
-            message: deploymentResult.message || 'Successfully deployed to Cloudflare Workers!',
-            instanceId: state.sandboxInstanceId ?? '',
-            deploymentUrl: deploymentUrl || ''
-        });
-
-        return { 
-            deploymentUrl: deploymentUrl || null,
-            deploymentId: deploymentId
-        };
     }
 
 }

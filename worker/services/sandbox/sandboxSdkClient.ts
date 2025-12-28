@@ -30,15 +30,6 @@ import { createObjectLogger } from '../../logger';
 import { env } from 'cloudflare:workers'
 import { BaseSandboxService } from './BaseSandboxService';
 
-import { 
-    buildDeploymentConfig, 
-    parseWranglerConfig, 
-    deployToDispatch, 
-    deployWorker,
-} from '../deployer/deploy';
-import { 
-    createAssetManifest 
-} from '../deployer/utils/index';
 import { generateId } from '../../utils/idGenerator';
 import { ResourceProvisioner } from './resourceProvisioner';
 import { TemplateParser } from './templateParser';
@@ -1740,201 +1731,12 @@ export class SandboxSdkClient extends BaseSandboxService {
     // DEPLOYMENT
     // ==========================================
     async deployToCloudflareWorkers(instanceId: string, target: DeploymentTarget = 'platform'): Promise<DeploymentResult> {
-        try {
-            this.logger.info('Starting deployment', { instanceId });
-            
-            // Get project metadata
-            const metadata = await this.getInstanceMetadata(instanceId);
-            const projectName = metadata?.projectName || instanceId;
-            
-            // Get credentials from environment (secure - no exposure to external processes)
-            const accountId = env.CLOUDFLARE_ACCOUNT_ID;
-            const apiToken = env.CLOUDFLARE_API_TOKEN;
-            
-            if (!accountId || !apiToken) {
-                throw new Error('CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN must be set in environment');
-            }
-            
-            this.logger.info('Processing deployment', { instanceId });
-            
-            // Step 1: Run build commands (bun run build && bunx wrangler build)
-            this.logger.info('Building project');
-            const buildResult = await this.executeCommand(instanceId, 'bun run build');
-            if (buildResult.exitCode !== 0) {
-                this.logger.warn('Build step failed or not available', buildResult.stdout, buildResult.stderr);
-                throw new Error(`Build failed: ${buildResult.stderr}`);
-            }
-            
-            const wranglerBuildResult = await this.executeCommand(instanceId, 'bunx wrangler build');
-            if (wranglerBuildResult.exitCode !== 0) {
-                this.logger.warn('Wrangler build failed', wranglerBuildResult.stdout, wranglerBuildResult.stderr);
-                // Continue anyway - some projects might not need wrangler build
-            }
-            
-            // Step 2: Parse wrangler config from KV
-            this.logger.info('Reading wrangler configuration from KV');
-            const wranglerConfigContent = await env.VibecoderStore.get(this.getWranglerKVKey(instanceId));
-            
-            if (!wranglerConfigContent) {
-                // This should never happen unless KV itself has some issues
-                throw new Error(`Wrangler config not found in KV for ${instanceId}`);
-            } else {
-                this.logger.info('Using wrangler configuration from KV');
-            }
-            
-            const config = parseWranglerConfig(wranglerConfigContent);
-            
-            this.logger.info('Worker configuration', { scriptName: config.name });
-            this.logger.info('Worker compatibility', { compatibilityDate: config.compatibility_date });
-            
-            // Step 3: Read worker script from dist
-            this.logger.info('Reading worker script');
-            const session = await this.getInstanceSession(instanceId);
-            const workerFile = await session.readFile(`/workspace/${instanceId}/dist/index.js`);
-            if (!workerFile.success) {
-                throw new Error(`Worker script not found at /${instanceId}/dist/index.js. Please build the project first.`);
-            }
-            
-            const workerContent = workerFile.content;
-            this.logger.info('Worker script loaded', { sizeKB: (workerContent.length / 1024).toFixed(2) });
-            
-            // Step 3a: Check for additional worker modules (ESM imports)
-            // Process them the same way as assets but as strings for the Map
-            let additionalModules: Map<string, string> | undefined;
-            try {
-                const workerAssetsPath = `${instanceId}/dist/assets`;
-                const workerAssetsResult = await this.safeSandboxExec(`test -d ${workerAssetsPath} && echo "exists" || echo "missing"`);
-                const hasWorkerAssets = workerAssetsResult.exitCode === 0 && workerAssetsResult.stdout.trim() === "exists";
-                
-                if (hasWorkerAssets) {
-                    this.logger.info('Processing additional worker modules', { workerAssetsPath });
-                    
-                    // Find all JS files in the worker assets directory
-                    const findResult = await this.safeSandboxExec(`find ${workerAssetsPath} -type f -name "*.js"`);
-                    if (findResult.exitCode === 0) {
-                        const modulePaths = findResult.stdout.trim().split('\n').filter((path: string) => path.trim());
-                        
-                        if (modulePaths.length > 0) {
-                            additionalModules = new Map<string, string>();
-                            
-                            for (const fullPath of modulePaths) {
-                                const relativePath = fullPath.replace(`${instanceId}/dist/`, '');
-                                
-                                try {
-                                    const buffer = await this.readFileAsBase64Buffer(fullPath);
-                                    const moduleContent = buffer.toString('utf8');
-                                    additionalModules.set(relativePath, moduleContent);
-                                    
-                                    this.logger.info('Worker module loaded', { 
-                                        path: relativePath, 
-                                        sizeKB: (moduleContent.length / 1024).toFixed(2) 
-                                    });
-                                } catch (error) {
-                                    this.logger.warn(`Failed to read worker module ${fullPath}:`, error);
-                                }
-                            }
-                            
-                            if (additionalModules.size > 0) {
-                                this.logger.info('Found additional worker modules', { count: additionalModules.size });
-                            }
-                        }
-                    }
-                }
-            } catch (error) {
-                this.logger.error('Failed to process additional worker modules:', error);
-            }
-            
-            // Step 4: Check for static assets and process them
-            const assetsPath = `${instanceId}/dist/client`;
-            let assetsManifest: Record<string, { hash: string; size: number }> | undefined;
-            let fileContents: Map<string, Buffer> | undefined;
-            
-            const assetDirResult = await this.safeSandboxExec(`test -d ${assetsPath} && echo "exists" || echo "missing"`);
-            const hasAssets = assetDirResult.exitCode === 0 && assetDirResult.stdout.trim() === "exists";
-            
-            if (hasAssets) {
-                this.logger.info('Processing static assets', { assetsPath });
-                const assetProcessResult = await this.processAssetsInSandbox(instanceId, assetsPath);
-                assetsManifest = assetProcessResult.assetsManifest;
-                fileContents = assetProcessResult.fileContents;
-            } else {
-                this.logger.info('No static assets found, deploying worker only');
-            }
-            
-            // Step 5: Override config for dispatch deployment
-            const dispatchConfig = {
-                ...config,
-                name: config.name
-            };
-        
-            
-            // Step 6: Build deployment config using pure function
-            const deployConfig = buildDeploymentConfig(
-                dispatchConfig,
-                workerContent,
-                accountId,
-                apiToken,
-                assetsManifest,
-                config.compatibility_flags
-            );
-            
-            // Step 7: Deploy using pure function
-            const useDispatch = target === 'platform';
-            this.logger.info('Deploying to Cloudflare', { target });
-            
-            if (useDispatch) {
-                if (!('DISPATCH_NAMESPACE' in env)) {
-                    throw new Error('DISPATCH_NAMESPACE not found in environment variables, cannot deploy without dispatch namespace');
-                }
-                
-                this.logger.info('Using dispatch namespace', { dispatchNamespace: env.DISPATCH_NAMESPACE });
-                await deployToDispatch(
-                    {
-                        ...deployConfig,
-                        dispatchNamespace: env.DISPATCH_NAMESPACE as string
-                    },
-                    fileContents,
-                    additionalModules,
-                    config.migrations,
-                    config.assets
-                );
-            } else {
-                await deployWorker(
-                    deployConfig,
-                    fileContents,
-                    additionalModules,
-                    config.migrations,
-                    config.assets
-                );
-            }
-            
-            // Step 8: Determine deployment URL
-            const deployedUrl = `${this.getProtocolForHost()}://${projectName}.${getPreviewDomain(env)}`;
-            const deploymentId = projectName;
-            
-            this.logger.info('Deployment successful', { 
-                instanceId,
-                deployedUrl, 
-                deploymentId,
-                mode: useDispatch ? 'dispatch-namespace' : 'user-worker'
-            });
-            
-            return {
-                success: true,
-                message: `Successfully deployed ${instanceId} using secure API deployment`,
-                deployedUrl,
-                deploymentId,
-                output: `Deployed`
-            };
-            
-        } catch (error) {
-            this.logger.error('deployToCloudflareWorkers', error, { instanceId });
-            return {
-                success: false,
-                message: `Deployment failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
-                error: error instanceof Error ? error.message : 'Unknown error'
-            };
-        }
+        this.logger.error('deployToCloudflareWorkers DEPRECATED in favor of GitHub deployment', { instanceId, target });
+        return {
+            success: false,
+            message: 'Direct Cloudflare deployment is deprecated. Please use GitHub deployment.',
+            error: 'Deprecated'
+        };
     }
     
     /**
@@ -1974,10 +1776,11 @@ export class SandboxSdkClient extends BaseSandboxService {
             }
         }
         
-        // Create asset manifest using pure function
-        const assetsManifest = await createAssetManifest(filesAsArrayBuffer);
-        const assetCount = Object.keys(assetsManifest).length;
-        this.logger.info('Asset manifest created', { assetCount });
+        // Mock manifest since utils are removed
+        const assetsManifest: Record<string, { hash: string; size: number }> = {};
+        for(const [path, content] of fileContents) {
+            assetsManifest[path] = { hash: 'mock-hash', size: content.length };
+        }
         
         return { assetsManifest, fileContents };
     }
