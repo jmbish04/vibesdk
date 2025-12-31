@@ -351,7 +351,7 @@ export class GitHubService {
      * Much simpler and faster than REST API approach
      * Automatically handles incremental sync and packfile optimization
      */
-    private static async pushViaGitProtocol(
+    static async pushViaGitProtocol(
         fs: MemFS,
         token: string,
         repositoryUrl: string,
