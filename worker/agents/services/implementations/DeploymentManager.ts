@@ -755,7 +755,7 @@ export class DeploymentManager extends BaseAgentService<BaseProjectState> implem
             // Get user info from state metadata or env
             // Fallback to generic if not found, but try to be better than hardcoded.
             const username = state.metadata?.userId || 'vibesdk-user';
-            const email = 'user@vibesdk.com'; // We might not have email in metadata, keeping generic for now or should be configured.
+            const email = this.env?.GIT_AUTHOR_EMAIL || 'user@vibesdk.com'; // We might not have email in metadata, keeping generic for now or should be configured.
 
             const pushResult = await RepoManager.pushToGitHub({
                 repoName,
