@@ -33,16 +33,7 @@ export class InfrastructureService {
                 body: JSON.stringify({ title })
             });
 
-            interface CloudflareResponse<T> {
-                success: boolean;
-                result: T;
-                errors: { code: number; message: string }[];
-            }
-            interface KVNamespace {
-                id: string;
-                title: string;
-            }
-            const data = await response.json() as CloudflareResponse<KVNamespace>;
+            const data = await response.json() as any;
 
             if (data.success) {
                 return data.result;

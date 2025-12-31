@@ -289,9 +289,23 @@ export class SandboxSdkClient extends BaseSandboxService {
 
         try {
             // Write script (1 request)
-            const writeResult = await session.writeFile(scriptPath, script);    // TODO: Checksum integrity verification
+            const writeResult = await session.writeFile(scriptPath, script);
             if (!writeResult.success) {
                 throw new Error('Failed to write batch script');
+            }
+
+            // Verify integrity of the written script by checking its size
+            const integrityCheck = await session.exec(`ls -l ${scriptPath} | awk '{print $5}'`);
+            const expectedSize = new TextEncoder().encode(script).length;
+            const actualSize = parseInt(integrityCheck.stdout.trim(), 10);
+
+            if (isNaN(actualSize) || actualSize !== expectedSize) {
+                this.logger.error('Batch script integrity check failed', {
+                    expectedSize,
+                    actualSize,
+                    stdout: integrityCheck.stdout
+                });
+                throw new Error(`Integrity check failed: Script size mismatch (expected ${expectedSize}, got ${actualSize})`);
             }
 
             // Execute with bash
