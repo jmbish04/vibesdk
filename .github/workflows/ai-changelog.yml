@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   ai-changelog:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.full_name && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || fromJSON('["self-hosted","Linux","X64","proxmox-actions"]') }}
     env:
       ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
       ANTHROPIC_CUSTOM_HEADERS: ${{ secrets.ANTHROPIC_CUSTOM_HEADERS }}

@@ -23,7 +23,7 @@ jobs:
         (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude'))
       )
 
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.full_name && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || fromJSON('["self-hosted","Linux","X64","proxmox-actions"]') }}
 
     concurrency:
       group: claude-review-${{ github.event.pull_request.number || github.event.issue.number }}

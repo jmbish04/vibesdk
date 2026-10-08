@@ -19,7 +19,7 @@ concurrency:
 jobs:
   gate:
     name: Gate (approval + trusted actor)
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.full_name && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || fromJSON('["self-hosted","Linux","X64","proxmox-actions"]') }}
     outputs:
       approved: ${{ steps.gate.outputs.approved }}
       trusted: ${{ steps.trusted.outputs.trusted }}
@@ -74,7 +74,7 @@ jobs:
     name: Create approved auto-fix PR
     needs: [gate]
     if: needs.gate.outputs.approved == 'true' && needs.gate.outputs.trusted == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.full_name && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || fromJSON('["self-hosted","Linux","X64","proxmox-actions"]') }}
     permissions:
       contents: write
       pull-requests: write
